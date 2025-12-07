@@ -1,0 +1,946 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ماشي - السوق المتكامل</title>
+    <!-- مكتبة Tailwind CSS للتصميم -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- خط Cairo العربي -->
+    <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap" rel="stylesheet">
+    <!-- مكتبة أيقونات Lucide -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    
+    <style>
+        /* تخصيص الخطوط والألوان */
+        body {
+            font-family: 'Cairo', sans-serif;
+            background-color: #f8fafc; /* Slate 50 */
+            color: #0f172a; /* Slate 900 */
+        }
+        /* تحسين شريط التمرير */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #f1f5f9;
+        }
+        ::-webkit-scrollbar-thumb {
+            background-color: #6366f1; /* Indigo 500 */
+            border-radius: 4px;
+        }
+        /* تأثيرات البطاقات */
+        .product-card {
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        .product-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 10px 20px -5px rgba(0, 0, 0, 0.15);
+        }
+        /* تمييز منتجات المستخدم الحالي */
+        .my-product {
+            border: 2px solid #14b8a6; /* Teal 500 */
+            background-color: #f0fdfa;
+        }
+        /* الأزرار النشطة في التنقل */
+        .nav-btn.active {
+            background-color: #4f46e5; /* Indigo 600 */
+            color: white;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1);
+        }
+        /* إصلاح سمك الأيقونات */
+        [data-lucide] { stroke-width: 2; }
+    </style>
+
+    <script type="module">
+        // استيراد مكتبات Firebase
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, addDoc, deleteDoc, onSnapshot, collection, runTransaction, getDocs, query, setLogLevel, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // تفعيل تسجيل الأخطاء (للتطوير)
+        setLogLevel('Debug');
+
+        // إعدادات التطبيق (تلقائية من البيئة)
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-mashi-app';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // إعدادات العمولة
+        const COMMISSION_RATE = 0.05; // 5%
+
+        let db, auth, userId = null;
+
+        // حالة التطبيق المحلية
+        const state = {
+            products: [],
+            cartItems: {},
+            isAuthReady: false,
+            currentView: 'store', // 'store', 'my_products', or 'sales_ledger'
+            maxOrderIndex: 0, // لحفظ ترتيب السلة
+            sales: [] // سجل المبيعات المكتملة
+        };
+
+        // ---------------------------------------------------------
+        // 1. تهيئة Firebase والمصادقة
+        // ---------------------------------------------------------
+        async function initFirebase() {
+            try {
+                // Initializing Firebase App and Services
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                // Authentication Promise to ensure userId is available before Firestore calls
+                const authReadyPromise = new Promise(resolve => {
+                    onAuthStateChanged(auth, async (user) => {
+                        if (!user) {
+                            if (initialAuthToken) {
+                                await signInWithCustomToken(auth, initialAuthToken);
+                            } else {
+                                await signInAnonymously(auth);
+                            }
+                        }
+                        // Set the current user ID
+                        userId = auth.currentUser?.uid || crypto.randomUUID();
+                        document.getElementById('user-status').innerHTML = `<span class="bg-indigo-100 text-indigo-700 px-2 py-1 rounded text-xs font-mono">ID: ${userId.substring(0,8)}...</span>`;
+                        state.isAuthReady = true;
+                        resolve();
+                    });
+                });
+
+                await authReadyPromise;
+                startDataListeners();
+                
+            } catch (err) {
+                console.error("Firebase Connection/Auth Error:", err);
+                showToast("حدث خطأ في الاتصال بالخادم", "bg-red-500");
+            }
+        }
+
+        // ---------------------------------------------------------
+        // 2. الاستماع للبيانات (Real-time)
+        // ---------------------------------------------------------
+        function startDataListeners() {
+            if (!state.isAuthReady || !userId) return;
+
+            // 1. Listen to Public Products (General Store)
+            const productsRef = collection(db, `artifacts/${appId}/public/data/products`);
+            onSnapshot(productsRef, (snapshot) => {
+                state.products = [];
+                snapshot.forEach(doc => state.products.push({ id: doc.id, ...doc.data() }));
+                renderProducts(); // Re-render the product grid/seller view
+            }, (error) => console.error("Error fetching products:", error));
+
+            // 2. Listen to Private Cart Items (User-specific)
+            const cartRef = collection(db, `artifacts/${appId}/users/${userId}/cart_items`);
+            onSnapshot(cartRef, (snapshot) => {
+                state.cartItems = {};
+                let totalItems = 0;
+                let totalPrice = 0;
+                let maxIndex = 0;
+
+                snapshot.forEach(doc => {
+                    const item = doc.data();
+                    state.cartItems[doc.id] = { id: doc.id, ...item };
+                    totalItems += item.quantity;
+                    totalPrice += item.finalBuyerPrice * item.quantity;
+                    if (item.orderIndex > maxIndex) maxIndex = item.orderIndex;
+                });
+                state.maxOrderIndex = maxIndex;
+                updateCartUI(totalItems, totalPrice);
+            }, (error) => console.error("Error fetching cart:", error));
+
+            // 3. Listen to Public Transactions (All Completed Sales)
+            const salesRef = collection(db, `artifacts/${appId}/public/data/transactions`);
+            onSnapshot(salesRef, (snapshot) => {
+                state.sales = [];
+                snapshot.forEach(doc => state.sales.push({ id: doc.id, ...doc.data() }));
+                renderSalesLedger(); // Re-render the sales ledger
+            }, (error) => console.error("Error fetching sales:", error));
+        }
+
+        // ---------------------------------------------------------
+        // 3. إدارة المنتجات (إضافة / حذف)
+        // ---------------------------------------------------------
+        window.submitProduct = async (e) => {
+            e.preventDefault();
+            if (!userId) { showToast("الرجاء انتظار المصادقة", "bg-yellow-600"); return; }
+            
+            const form = e.target;
+            const name = form.name.value.trim();
+            const brand = form.brand.value.trim();
+            const sellerPrice = parseFloat(form.price.value);
+            const desc = form.desc.value.trim();
+            const file = form.imageFile.files[0];
+
+            if (!name || !brand || !sellerPrice || !desc) {
+                showToast("الرجاء ملء جميع الحقول", "bg-red-500");
+                return;
+            }
+
+            // Calculate commission and final price
+            const commissionAmount = sellerPrice * COMMISSION_RATE;
+            const finalBuyerPrice = sellerPrice + commissionAmount;
+
+            // Image handling (using placeholders)
+            let imageUrl = 'https://placehold.co/600x400/e2e8f0/64748b?text=No+Image';
+            if (file) {
+                const unique = Date.now().toString().slice(-4);
+                imageUrl = `https://placehold.co/600x400/4f46e5/ffffff?text=${encodeURIComponent(name.split(' ')[0])}+${unique}`;
+            }
+
+            try {
+                await addDoc(collection(db, `artifacts/${appId}/public/data/products`), {
+                    name, brand, desc, imageUrl,
+                    sellerPrice, commissionRate: COMMISSION_RATE, commissionAmount, finalBuyerPrice,
+                    sellerId: userId,
+                    createdAt: Date.now()
+                });
+                
+                showToast("تم نشر الإعلان بنجاح!", "bg-green-600");
+                window.toggleModal(); // Close the modal
+                window.switchView('my_products'); // Switch to seller view
+            } catch (err) {
+                console.error(err);
+                showToast("فشل في نشر الإعلان", "bg-red-600");
+            }
+        };
+
+        window.deleteProductHandler = async (productId) => {
+            // Use custom confirm modal instead of native confirm()
+            if (await showConfirmModal("تأكيد الحذف", "هل أنت متأكد من حذف هذا الإعلان نهائياً؟ هذا الإجراء لا رجعة فيه.")) {
+                try {
+                    await deleteDoc(doc(db, `artifacts/${appId}/public/data/products/${productId}`));
+                    showToast("تم حذف المنتج", "bg-gray-700");
+                } catch (err) {
+                    showToast("خطأ أثناء الحذف", "bg-red-600");
+                }
+            }
+        };
+
+        // ---------------------------------------------------------
+        // 4. إدارة السلة (إضافة / حذف / ترتيب)
+        // ---------------------------------------------------------
+        window.addToCartHandler = async (productId) => {
+            if (!userId) { showToast("الرجاء انتظار المصادقة", "bg-yellow-600"); return; }
+            
+            const product = state.products.find(p => p.id === productId);
+            if (!product || product.sellerId === userId) {
+                showToast("لا يمكنك شراء منتجك الخاص أو المنتج غير موجود.", "bg-yellow-600");
+                return;
+            }
+
+            const itemRef = doc(db, `artifacts/${appId}/users/${userId}/cart_items/${productId}`);
+            
+            try {
+                await runTransaction(db, async (transaction) => {
+                    const docSnap = await transaction.get(itemRef);
+                    if (docSnap.exists()) {
+                        transaction.update(itemRef, { quantity: docSnap.data().quantity + 1 });
+                    } else {
+                        // Add new item at the end of the order
+                        const newIndex = (state.maxOrderIndex || 0) + 1;
+                        transaction.set(itemRef, {
+                            productId: product.id,
+                            name: product.name,
+                            brand: product.brand,
+                            finalBuyerPrice: product.finalBuyerPrice,
+                            sellerPrice: product.sellerPrice, // حفظ سعر البائع لحساب العمولة لاحقًا
+                            sellerId: product.sellerId,
+                            quantity: 1,
+                            orderIndex: newIndex
+                        });
+                    }
+                });
+                showToast("تمت الإضافة إلى السلة", "bg-indigo-600");
+            } catch (err) {
+                console.error(err);
+                showToast("فشل في الإضافة إلى السلة", "bg-red-600");
+            }
+        };
+
+        // Checkout process: Moves cart items to a sales ledger and clears the cart.
+        window.checkoutHandler = async () => {
+            const cartItemsArray = Object.values(state.cartItems);
+            if (cartItemsArray.length === 0) return;
+            
+            if (await showConfirmModal("تأكيد الشراء", "هل أنت متأكد من إتمام عملية الشراء ودفع المبلغ الإجمالي؟")) {
+                try {
+                    const cartRef = collection(db, `artifacts/${appId}/users/${userId}/cart_items`);
+                    const transactionsRef = collection(db, `artifacts/${appId}/public/data/transactions`);
+                    const batch = writeBatch(db);
+                    const now = Date.now();
+
+                    // 1. Move items to transactions and prepare for cart deletion
+                    cartItemsArray.forEach(item => {
+                        const transactionData = {
+                            productId: item.productId,
+                            name: item.name,
+                            brand: item.brand,
+                            sellerId: item.sellerId,
+                            buyerId: userId,
+                            quantity: item.quantity,
+                            finalBuyerPrice: item.finalBuyerPrice,
+                            sellerPrice: item.sellerPrice,
+                            commissionAmount: (item.finalBuyerPrice - item.sellerPrice), // Commission per unit
+                            totalSaleAmount: item.finalBuyerPrice * item.quantity,
+                            totalSellerProfit: item.sellerPrice * item.quantity, // Gross profit before platform deduction
+                            purchasedAt: now
+                        };
+                        // Add the transaction (sale) to the public ledger
+                        batch.set(doc(transactionsRef), transactionData);
+
+                        // Mark item for deletion from the cart
+                        batch.delete(doc(cartRef, item.id));
+                    });
+                    
+                    await batch.commit();
+                    
+                    showToast("تم إتمام عملية الشراء بنجاح! شكراً لك.", "bg-green-600");
+                } catch (err) {
+                    console.error("Checkout failed:", err);
+                    showToast("فشلت عملية الشراء. حاول مرة أخرى.", "bg-red-600");
+                }
+            }
+        };
+        
+        // Remove an item entirely from the cart
+        window.removeItemFromCart = async (itemId) => {
+            if (!userId) return;
+            try {
+                await deleteDoc(doc(db, `artifacts/${appId}/users/${userId}/cart_items/${itemId}`));
+                showToast("تمت إزالة العنصر من السلة", "bg-gray-500");
+            } catch (err) {
+                console.error("Failed to remove item", err);
+                showToast("فشل في إزالة العنصر", "bg-red-600");
+            }
+        };
+
+        // Handles moving an item up or down in the cart list
+        window.moveCartItem = async (itemId, direction) => {
+            if (!userId) return;
+
+            // Sort locally to find the neighbors
+            const sortedItems = Object.values(state.cartItems).sort((a, b) => a.orderIndex - b.orderIndex);
+            const currentIndex = sortedItems.findIndex(i => i.id === itemId);
+            const targetIndex = direction === 'up' ? currentIndex - 1 : currentIndex + 1;
+
+            if (targetIndex < 0 || targetIndex >= sortedItems.length) return; // Out of bounds
+
+            const itemA = sortedItems[currentIndex];
+            const itemB = sortedItems[targetIndex];
+
+            try {
+                // Swap the orderIndex values in the database using a transaction
+                await runTransaction(db, async (transaction) => {
+                    const refA = doc(db, `artifacts/${appId}/users/${userId}/cart_items/${itemA.id}`);
+                    const refB = doc(db, `artifacts/${appId}/users/${userId}/cart_items/${itemB.id}`);
+                    
+                    // Perform the swap
+                    transaction.update(refA, { orderIndex: itemB.orderIndex });
+                    transaction.update(refB, { orderIndex: itemA.orderIndex });
+                });
+            } catch (err) {
+                console.error("Failed to change order", err);
+            }
+        };
+
+        // ---------------------------------------------------------
+        // 5. واجهة المستخدم (UI Helpers)
+        // ---------------------------------------------------------
+        window.switchView = (viewName) => {
+            state.currentView = viewName;
+            
+            // Toggle navigation buttons active state
+            document.querySelectorAll('.nav-btn').forEach(btn => btn.classList.remove('active', 'bg-indigo-600', 'text-white'));
+            document.querySelectorAll('.nav-btn').forEach(btn => btn.classList.add('bg-white', 'text-gray-600', 'hover:bg-gray-50'));
+            
+            const activeBtn = document.getElementById(`btn-${viewName}`);
+            if(activeBtn) {
+                activeBtn.classList.add('active');
+                activeBtn.classList.remove('bg-white', 'text-gray-600', 'hover:bg-gray-50');
+            }
+
+            // Show/Hide main view sections
+            document.getElementById('store-view').classList.toggle('hidden', viewName !== 'store');
+            document.getElementById('seller-view').classList.toggle('hidden', viewName !== 'my_products');
+            document.getElementById('ledger-view').classList.toggle('hidden', viewName !== 'sales_ledger');
+
+            // Update page title and safety tip visibility (Safety tip only for my_products)
+            document.getElementById('safety-tip').classList.toggle('hidden', viewName !== 'my_products');
+
+            if (viewName === 'store' || viewName === 'my_products') {
+                 // The product rendering function also handles the title update for these two views
+                 renderProducts();
+            } else if (viewName === 'sales_ledger') {
+                 renderSalesLedger();
+            }
+        };
+
+        function renderProducts() {
+            const isStore = state.currentView === 'store';
+            
+            // **التعديل الجديد:** تحديد الـ ID الصحيح للحاوية بناءً على العرض الحالي
+            const containerId = isStore ? 'products-grid' : 'my-products-grid';
+            const container = document.getElementById(containerId);
+
+            if (!container) return; // فحص أمان
+
+            // Filter products
+            const items = isStore ? state.products : state.products.filter(p => p.sellerId === userId);
+            
+            // Update page title
+            document.getElementById('page-title').textContent = isStore ? 'أحدث العروض (أحذية وملابس)' : 'إعلاناتي المعروضة للبيع';
+
+            if (items.length === 0) {
+                container.innerHTML = `
+                    <div class="col-span-full text-center py-20 bg-white rounded-3xl border border-dashed border-gray-300">
+                        <i data-lucide="${isStore ? 'shopping-bag' : 'tag'}" class="w-16 h-16 mx-auto text-gray-300 mb-4"></i>
+                        <p class="text-gray-500 text-lg">لا توجد عناصر لعرضها حالياً. ${!isStore ? 'اضغط "إضافة إعلان" لنشر منتجك الأول.' : ''}</p>
+                    </div>`;
+                lucide.createIcons();
+                return;
+            }
+
+            container.innerHTML = items.map(p => {
+                const isMine = p.sellerId === userId;
+                // Ensure prices are numbers before toFixed
+                const finalBuyerPrice = p.finalBuyerPrice !== undefined && p.finalBuyerPrice !== null ? p.finalBuyerPrice : 0;
+                const sellerPrice = p.sellerPrice !== undefined && p.sellerPrice !== null ? p.sellerPrice : 0;
+                const commissionAmount = p.commissionAmount !== undefined && p.commissionAmount !== null ? p.commissionAmount : 0;
+
+                const price = finalBuyerPrice.toFixed(2);
+                
+                const sellerPart = isMine 
+                    ? `<div class="mt-3 pt-3 border-t border-gray-100 text-xs text-gray-500">
+                        <div class="flex justify-between"><span>ربحك الصافي:</span><span class="font-bold text-teal-600">${sellerPrice.toFixed(2)} د.أ</span></div>
+                        <div class="flex justify-between"><span>العمولة (5%):</span><span class="font-bold text-red-500">${commissionAmount.toFixed(2)} د.أ</span></div>
+                       </div>` 
+                    : '';
+
+                // **المنطق الجديد لزر الإجراء**
+                let actionButton;
+                if (isStore) {
+                    // في السوق العام: دائماً زر "ضع في السلة"
+                    actionButton = `<button onclick="window.addToCartHandler('${p.id}')" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-xl font-bold shadow-lg shadow-indigo-300 hover:shadow-xl transition-all flex items-center gap-2 transform active:scale-95">
+                                    <i data-lucide="shopping-cart" class="w-4 h-4"></i> ضع في السلة
+                                   </button>`;
+                } else {
+                    // في إعلاناتي: دائماً زر "حذف"
+                    actionButton = `<button onclick="window.deleteProductHandler('${p.id}')" class="text-red-500 hover:bg-red-50 p-2 rounded-lg transition-colors flex items-center gap-1 text-sm font-bold">
+                                    <i data-lucide="trash-2" class="w-4 h-4"></i> حذف
+                                   </button>`;
+                }
+                
+                return `
+                <div class="product-card bg-white rounded-2xl overflow-hidden border border-gray-100 flex flex-col h-full ${isMine ? 'my-product shadow-lg' : 'shadow-md'}">
+                    <!-- الصورة -->
+                    <div class="relative h-64 bg-gray-100">
+                        <img src="${p.imageUrl}" class="w-full h-full object-cover" onerror="this.src='https://placehold.co/600x400?text=خطأ'">
+                        ${isMine ? '<span class="absolute top-3 right-3 bg-teal-500 text-white text-xs font-bold px-3 py-1 rounded-full shadow-md">إعلانك</span>' : ''}
+                        ${!isStore ? `<span class="absolute top-3 left-3 bg-gray-900/60 text-white text-xs font-bold px-3 py-1 rounded-full shadow-md">السعر للمشتري: ${price} د.أ</span>` : ''}
+                    </div>
+                    
+                    <!-- المحتوى -->
+                    <div class="p-5 flex flex-col flex-grow">
+                        <div class="flex justify-between items-start">
+                            <div>
+                                <p class="text-xs text-indigo-600 font-bold mb-1">${p.brand || 'عام'}</p>
+                                <h3 class="text-lg font-bold text-gray-900 leading-tight">${p.name}</h3>
+                            </div>
+                            <span class="text-xs font-mono bg-gray-100 px-2 py-1 rounded text-gray-500">${p.sellerId ? p.sellerId.substring(0,4) : '....'}</span>
+                        </div>
+                        
+                        <p class="text-gray-500 text-sm mt-3 line-clamp-2 flex-grow">${p.desc}</p>
+                        
+                        ${sellerPart}
+
+                        <div class="mt-5 flex items-center justify-between">
+                            ${!isMine ? 
+                                `<span class="text-2xl font-black text-gray-900">${price} <span class="text-sm font-normal text-gray-500">د.أ</span></span>` : 
+                                `<span class="text-base font-bold text-gray-700">الربح الصافي معروض أعلاه</span>`
+                            }
+                            
+                            ${actionButton}
+                        </div>
+                    </div>
+                </div>`;
+            }).join('');
+            lucide.createIcons();
+        }
+
+        function renderSalesLedger() {
+            document.getElementById('page-title').textContent = 'سجل المبيعات والأرباح';
+
+            const container = document.getElementById('sales-ledger-container');
+            
+            // Filter sales where the current user is the seller, and sort by date descending
+            const mySales = state.sales
+                .filter(s => s.sellerId === userId)
+                .sort((a, b) => b.purchasedAt - a.purchasedAt);
+                
+            // Calculate total profit
+            const totalProfit = mySales.reduce((acc, sale) => acc + sale.totalSellerProfit, 0);
+
+            let content = '';
+
+            if (mySales.length === 0) {
+                content = `
+                    <div class="text-center py-20 bg-white rounded-3xl border border-dashed border-gray-300 col-span-full">
+                        <i data-lucide="line-chart" class="w-16 h-16 mx-auto text-gray-300 mb-4"></i>
+                        <p class="text-gray-500 text-lg">لم تتم أي عملية بيع بعد.</p>
+                        <p class="text-sm text-gray-400 mt-2">انشر إعلانك وستظهر أرباحك هنا فوراً.</p>
+                    </div>`;
+            } else {
+                const salesList = mySales.map(s => {
+                    const date = new Date(s.purchasedAt).toLocaleDateString('ar-EG', { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+                    const profit = s.totalSellerProfit.toFixed(2);
+                    const commission = (s.commissionAmount * s.quantity).toFixed(2);
+                    const totalSale = s.totalSaleAmount.toFixed(2);
+                    
+                    return `
+                    <div class="bg-white p-5 rounded-2xl shadow-md border border-gray-100 flex justify-between items-start gap-4 flex-wrap">
+                        <!-- معلومات المنتج والمشتري -->
+                        <div class="flex-grow min-w-[200px]">
+                            <p class="font-black text-lg text-gray-900">${s.name} (${s.quantity}x)</p>
+                            <p class="text-sm text-gray-500 mb-2">المشتري ID: <span class="font-mono text-xs bg-gray-100 px-2 rounded">${s.buyerId.substring(0, 8)}...</span></p>
+                            <p class="text-xs text-gray-400">بتاريخ: ${date}</p>
+                        </div>
+                        
+                        <!-- تفاصيل الأرباح -->
+                        <div class="text-left space-y-1">
+                            <div class="flex justify-between items-center gap-4">
+                                <span class="text-sm font-medium text-gray-600">إجمالي البيع:</span>
+                                <span class="font-bold text-gray-800">${totalSale} د.أ</span>
+                            </div>
+                            <div class="flex justify-between items-center gap-4">
+                                <span class="text-sm font-medium text-gray-600">عمولة المنصة:</span>
+                                <span class="font-bold text-red-500">- ${commission} د.أ</span>
+                            </div>
+                            <div class="flex justify-between items-center pt-2 border-t border-dashed border-gray-200">
+                                <span class="font-black text-indigo-700">ربحك الصافي:</span>
+                                <span class="font-black text-2xl text-teal-600">${profit} د.أ</span>
+                            </div>
+                        </div>
+                    </div>`;
+                }).join('');
+
+                content = `
+                    <div class="bg-indigo-600 text-white p-6 rounded-3xl shadow-xl mb-8 flex justify-between items-center">
+                        <div>
+                            <p class="text-sm font-medium opacity-80">إجمالي الأرباح الصافية (بعد العمولة)</p>
+                            <h2 class="text-4xl font-black mt-1">${totalProfit.toFixed(2)} د.أ</h2>
+                        </div>
+                        <i data-lucide="wallet" class="w-12 h-12 opacity-50"></i>
+                    </div>
+                    <h3 class="text-xl font-bold mb-4 text-gray-800">تفاصيل آخر المعاملات (${mySales.length} عملية)</h3>
+                    <div class="space-y-4">
+                        ${salesList}
+                    </div>
+                `;
+            }
+
+            container.innerHTML = content;
+            lucide.createIcons();
+        }
+
+
+        function updateCartUI(count, total) {
+            // Update the counter badge
+            const badge = document.getElementById('cart-badge');
+            badge.innerText = count;
+            badge.classList.toggle('hidden', count === 0);
+            
+            // Update the total price
+            document.getElementById('cart-total').innerText = total.toFixed(2);
+
+            const listEl = document.getElementById('cart-items-list');
+            const checkoutDiv = document.getElementById('checkout-div');
+            
+            // Convert object to array and sort by orderIndex
+            const sortedItems = Object.values(state.cartItems).sort((a, b) => a.orderIndex - b.orderIndex);
+
+            if (sortedItems.length === 0) {
+                listEl.innerHTML = '<div class="text-center py-8 text-gray-400">السلة فارغة</div>';
+                checkoutDiv.classList.add('hidden');
+                return;
+            }
+
+            checkoutDiv.classList.remove('hidden');
+            listEl.innerHTML = sortedItems.map((item, index) => {
+                const isFirst = index === 0;
+                const isLast = index === sortedItems.length - 1;
+                
+                return `
+                <div class="flex items-center gap-3 p-3 bg-gray-50 rounded-xl border border-gray-100 group">
+                    <!-- أزرار الترتيب والحذف -->
+                    <div class="flex flex-col gap-1">
+                        <button onclick="window.moveCartItem('${item.id}', 'up')" ${isFirst ? 'disabled' : ''} class="p-1 hover:bg-white rounded-md shadow-sm disabled:opacity-30 disabled:cursor-not-allowed text-gray-600 transition-colors">
+                            <i data-lucide="chevron-up" class="w-3 h-3"></i>
+                        </button>
+                        <button onclick="window.moveCartItem('${item.id}', 'down')" ${isLast ? 'disabled' : ''} class="p-1 hover:bg-white rounded-md shadow-sm disabled:opacity-30 disabled:cursor-not-allowed text-gray-600 transition-colors">
+                            <i data-lucide="chevron-down" class="w-3 h-3"></i>
+                        </button>
+                    </div>
+                    
+                    <!-- تفاصيل -->
+                    <div class="flex-grow">
+                        <p class="font-bold text-sm text-gray-800">${item.name}</p>
+                        <p class="text-xs text-gray-500">${item.brand}</p>
+                    </div>
+                    
+                    <!-- السعر والكمية -->
+                    <div class="text-right">
+                        <p class="font-black text-indigo-600 text-lg">${(item.finalBuyerPrice * item.quantity).toFixed(2)}</p>
+                        <p class="text-sm text-gray-500 font-bold">${item.quantity}x</p>
+                    </div>
+                    
+                    <!-- زر الحذف من السلة -->
+                    <button onclick="window.removeItemFromCart('${item.id}')" class="p-1 text-red-400 hover:text-red-600 transition-colors self-start">
+                        <i data-lucide="x" class="w-4 h-4"></i>
+                    </button>
+                </div>`;
+            }).join('');
+            lucide.createIcons();
+        }
+
+        // ---------------------------------------------------------
+        // 6. واجهة النموذج (Modal Logic)
+        // ---------------------------------------------------------
+        window.toggleModal = () => {
+            const modal = document.getElementById('add-modal');
+            modal.classList.toggle('hidden');
+            if (modal.classList.contains('hidden')) {
+                // Reset form on close
+                document.getElementById('add-form').reset();
+                document.getElementById('preview-image').classList.add('hidden');
+                document.getElementById('upload-placeholder').classList.remove('hidden');
+                window.updateCommission(document.querySelector('input[name="price"]'));
+            }
+        };
+
+        window.handleFileSelect = (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = (ev) => {
+                    document.getElementById('preview-image').src = ev.target.result;
+                    document.getElementById('preview-image').classList.remove('hidden');
+                    document.getElementById('upload-placeholder').classList.add('hidden');
+                };
+                reader.readAsDataURL(file);
+            }
+        };
+
+        window.updateCommission = (input) => {
+            const val = parseFloat(input.value) || 0;
+            const comm = val * COMMISSION_RATE;
+            const total = val + comm;
+            
+            document.getElementById('calc-commission').innerText = comm.toFixed(2);
+            document.getElementById('calc-total').innerText = total.toFixed(2);
+        };
+
+        // ---------------------------------------------------------
+        // 7. أدوات واجهة المستخدم المتقدمة (استبدال التنبيهات الأصلية)
+        // ---------------------------------------------------------
+
+        // Show user messages (Toast)
+        function showToast(msg, bgClass) {
+            const toast = document.getElementById('toast');
+            toast.innerText = msg;
+            toast.className = `fixed top-5 left-1/2 transform -translate-x-1/2 px-6 py-3 rounded-full text-white font-bold shadow-xl transition-all duration-300 z-50 ${bgClass}`;
+            toast.style.opacity = '1';
+            setTimeout(() => { toast.style.opacity = '0'; }, 3000);
+        }
+
+        // Custom Confirmation Modal (replace window.confirm)
+        function showConfirmModal(title, message) {
+            return new Promise(resolve => {
+                const modal = document.getElementById('confirm-modal');
+                const modalTitle = document.getElementById('confirm-title');
+                const modalMessage = document.getElementById('confirm-message');
+                const confirmBtn = document.getElementById('confirm-action-btn');
+                const cancelBtn = document.getElementById('confirm-cancel-btn');
+
+                modalTitle.textContent = title;
+                modalMessage.textContent = message;
+                modal.classList.remove('hidden');
+                
+                const handleConfirm = () => {
+                    modal.classList.add('hidden');
+                    // Remove listeners to prevent multiple triggers
+                    confirmBtn.removeEventListener('click', handleConfirm);
+                    cancelBtn.removeEventListener('click', handleCancel);
+                    resolve(true);
+                };
+
+                const handleCancel = () => {
+                    modal.classList.add('hidden');
+                    confirmBtn.removeEventListener('click', handleConfirm);
+                    cancelBtn.removeEventListener('click', handleCancel);
+                    resolve(false);
+                };
+
+                // Clear previous listeners and attach new ones
+                confirmBtn.addEventListener('click', handleConfirm, { once: true });
+                cancelBtn.addEventListener('click', handleCancel, { once: true });
+            });
+        }
+
+
+        // Initial run on window load
+        window.onload = () => {
+            initFirebase();
+            lucide.createIcons();
+            window.switchView('store');
+        };
+    </script>
+</head>
+<body class="bg-gray-50 min-h-screen pb-20">
+
+    <!-- رسالة التنبيه (Toast) -->
+    <div id="toast" class="fixed top-5 left-1/2 transform -translate-x-1/2 opacity-0 pointer-events-none transition-opacity"></div>
+    
+    <!-- نافذة التأكيد المخصصة (Confirm Modal) - بديل لـ confirm() -->
+    <div id="confirm-modal" class="fixed inset-0 z-[60] hidden">
+        <div class="absolute inset-0 bg-gray-900/60 backdrop-blur-sm"></div>
+        <div class="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 w-full max-w-sm bg-white rounded-3xl shadow-2xl p-6">
+            <h3 id="confirm-title" class="text-xl font-black text-gray-900 mb-3">تأكيد</h3>
+            <p id="confirm-message" class="text-gray-600 mb-6 text-sm"></p>
+            <div class="flex justify-end gap-3">
+                <button id="confirm-cancel-btn" class="bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold py-3 px-4 rounded-xl transition-colors">
+                    إلغاء
+                </button>
+                <button id="confirm-action-btn" class="bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-6 rounded-xl transition-colors">
+                    تأكيد الإجراء
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- الشريط العلوي -->
+    <header class="bg-white border-b border-gray-200 sticky top-0 z-40 shadow-sm/50 backdrop-blur-md bg-white/90">
+        <div class="max-w-5xl mx-auto px-4 py-3 flex justify-between items-center">
+            
+            <!-- الشعار -->
+            <div class="flex items-center gap-2 cursor-pointer" onclick="window.switchView('store')">
+                <div class="bg-indigo-600 text-white p-2 rounded-xl">
+                    <i data-lucide="store" class="w-6 h-6"></i>
+                </div>
+                <div>
+                    <h1 class="text-2xl font-black text-gray-900 tracking-tighter">ماشي</h1>
+                    <p class="text-[10px] text-gray-500 font-bold -mt-1">سوق الملابس والأحذية</p>
+                </div>
+            </div>
+
+            <!-- الأدوات -->
+            <div class="flex items-center gap-4">
+                
+                <!-- حالة المستخدم (مهم لإظهار userId) -->
+                <div id="user-status" class="hidden md:block">
+                    <span class="bg-gray-100 text-gray-500 px-2 py-1 rounded text-xs font-mono">...جاري المصادقة</span>
+                </div>
+
+                <!-- زر الإضافة -->
+                <button onclick="window.toggleModal()" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-xl font-bold shadow-lg shadow-indigo-200 transition-all flex items-center gap-2 transform hover:scale-105 active:scale-95">
+                    <i data-lucide="plus" class="w-5 h-5"></i>
+                    <span class="hidden sm:inline">إضافة إعلان</span>
+                </button>
+
+                <!-- سلة التسوق -->
+                <div class="relative group">
+                    <button class="relative p-2 text-gray-600 hover:text-indigo-600 transition-colors">
+                        <i data-lucide="shopping-bag" class="w-7 h-7"></i>
+                        <span id="cart-badge" class="hidden absolute -top-1 -right-1 bg-red-500 text-white text-[10px] font-bold w-5 h-5 flex items-center justify-center rounded-full border-2 border-white">0</span>
+                    </button>
+
+                    <!-- القائمة المنسدلة للسلة (بأولوية الترتيب) -->
+                    <div class="absolute left-0 top-full mt-2 w-80 bg-white rounded-2xl shadow-2xl border border-gray-100 opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 transform translate-y-2 group-hover:translate-y-0 z-50">
+                        <div class="p-4 border-b border-gray-50 bg-gray-50/50 rounded-t-2xl">
+                            <h3 class="font-bold text-gray-900 flex items-center gap-2">
+                                <i data-lucide="shopping-cart" class="w-4 h-4 text-indigo-500"></i> سلة المشتريات (يمكنك تغيير ترتيب العناصر)
+                            </h3>
+                        </div>
+                        <div id="cart-items-list" class="max-h-64 overflow-y-auto p-2 space-y-1">
+                            <!-- العناصر مع أزرار الترتيب والحذف -->
+                        </div>
+                        <div id="checkout-div" class="p-4 border-t border-gray-50 bg-gray-50/50 rounded-b-2xl hidden">
+                            <div class="flex justify-between items-center mb-3 text-sm">
+                                <span class="text-gray-600">الإجمالي:</span>
+                                <span class="font-black text-indigo-700 text-lg"><span id="cart-total">0.00</span> د.أ</span>
+                            </div>
+                            <button onclick="window.checkoutHandler()" class="w-full bg-green-500 hover:bg-green-600 text-white font-bold py-3 rounded-xl shadow-md transition-transform active:scale-95">
+                                إتمام الشراء
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- المحتوى -->
+    <main class="max-w-5xl mx-auto px-4 py-8">
+        
+        <!-- أزرار التنقل -->
+        <div class="flex justify-center mb-8">
+            <div class="bg-white p-1.5 rounded-2xl border border-gray-200 shadow-sm inline-flex">
+                <button id="btn-store" onclick="window.switchView('store')" class="nav-btn active px-6 py-2.5 rounded-xl font-bold text-sm transition-all duration-200">
+                    السوق العام
+                </button>
+                <button id="btn-my_products" onclick="window.switchView('my_products')" class="nav-btn bg-white text-gray-600 px-6 py-2.5 rounded-xl font-bold text-sm transition-all duration-200 hover:bg-gray-50">
+                    إعلاناتي (البائع)
+                </button>
+                <button id="btn-sales_ledger" onclick="window.switchView('sales_ledger')" class="nav-btn bg-white text-gray-600 px-6 py-2.5 rounded-xl font-bold text-sm transition-all duration-200 hover:bg-gray-50">
+                    سجل المبيعات
+                </button>
+            </div>
+        </div>
+
+        <!-- نصائح الأمان (تظهر فقط في صفحة البائع) -->
+        <div id="safety-tip" class="hidden bg-amber-50 border border-amber-200 rounded-2xl p-6 mb-8">
+            <div class="flex items-center gap-3 mb-4">
+                <div class="bg-amber-100 p-2 rounded-full text-amber-600">
+                    <i data-lucide="shield-alert" class="w-6 h-6"></i>
+                </div>
+                <h3 class="font-bold text-amber-800 text-lg">دليل الأمان وسلامة البائع</h3>
+            </div>
+            
+            <ul class="space-y-3 text-sm text-amber-900/80">
+                <li class="flex items-start gap-2">
+                    <i data-lucide="map-pin" class="w-5 h-5 text-amber-600 mt-0.5 flex-shrink-0"></i>
+                    <span>**اللقاء في مكان عام:** احرص دائماً على مقابلة المشتري في أماكن عامة آمنة، مزدحمة، ومضاءة جيداً (مثل المولات أو المقاهي) وتجنب الأماكن المعزولة.</span>
+                </li>
+                <li class="flex items-start gap-2">
+                    <i data-lucide="users" class="w-5 h-5 text-amber-600 mt-0.5 flex-shrink-0"></i>
+                    <span>**اصطحب مرافقاً:** يفضل أن يكون معك صديق أو فرد من العائلة عند تسليم المنتج، خاصة في اللقاء الأول.</span>
+                </li>
+                <li class="flex items-start gap-2">
+                    <i data-lucide="lock" class="w-5 h-5 text-amber-600 mt-0.5 flex-shrink-0"></i>
+                    <span>**حماية البيانات:** لا تشارك معلوماتك البنكية، أرقامك السرية، أو عنوان منزلك الدقيق في الوصف العام أو الرسائل العامة.</span>
+                </li>
+                <li class="flex items-start gap-2">
+                    <i data-lucide="banknote" class="w-5 h-5 text-amber-600 mt-0.5 flex-shrink-0"></i>
+                    <span>**استلام المبلغ:** في حال الدفع النقدي، تأكد من استلام المبلغ كاملاً والتحقق منه قبل تسليم المنتج نهائياً.</span>
+                </li>
+                <li class="flex items-start gap-2">
+                    <i data-lucide="check-circle-2" class="w-5 h-5 text-amber-600 mt-0.5 flex-shrink-0"></i>
+                    <span>**المصداقية:** تأكد من دقة وصف المنتج وصوره لتجنب أي سوء تفاهم أو خلافات وقت التسليم.</span>
+                </li>
+            </ul>
+        </div>
+
+        <!-- العنوان الرئيسي -->
+        <div class="flex items-center gap-3 mb-6">
+            <div class="h-8 w-1.5 bg-indigo-600 rounded-full"></div>
+            <h2 id="page-title" class="text-2xl font-black text-gray-900">أحدث العروض</h2>
+        </div>
+        
+        <!-- قسم السوق والإعلانات -->
+        <div id="store-view">
+             <!-- شبكة المنتجات -->
+            <div id="products-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+                <!-- سيتم ملؤها بالجافاسكريبت -->
+            </div>
+        </div>
+
+        <!-- **التعديل هنا:** إضافة حاوية جديدة لعرض إعلانات البائع -->
+        <div id="seller-view" class="hidden">
+            <div id="my-products-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+                <!-- سيتم ملؤها بالجافاسكريبت -->
+            </div>
+        </div>
+
+        <!-- قسم سجل المبيعات والأرباح (الجديد) -->
+        <div id="ledger-view" class="hidden">
+            <div id="sales-ledger-container" class="grid grid-cols-1 gap-6">
+                <!-- سيتم ملؤها بالجافاسكريبت بعد إتمام عملية شراء -->
+            </div>
+        </div>
+
+    </main>
+
+    <!-- نافذة إضافة منتج (Modal) -->
+    <div id="add-modal" class="fixed inset-0 z-50 hidden">
+        <div class="absolute inset-0 bg-gray-900/60 backdrop-blur-sm transition-opacity" onclick="window.toggleModal()"></div>
+        
+        <div class="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 w-full max-w-lg bg-white rounded-3xl shadow-2xl p-6 sm:p-8 animate-[fade-in_0.3s_ease-out] overflow-y-auto max-h-[95vh]">
+            
+            <div class="flex justify-between items-center mb-6">
+                <h3 class="text-2xl font-black text-gray-900">إضافة إعلان جديد</h3>
+                <button onclick="window.toggleModal()" class="bg-gray-100 hover:bg-red-100 hover:text-red-600 p-2 rounded-full transition-colors">
+                    <i data-lucide="x" class="w-5 h-5"></i>
+                </button>
+            </div>
+
+            <form id="add-form" onsubmit="window.submitProduct(event)" class="space-y-5">
+                
+                <!-- رفع الصورة -->
+                <div>
+                    <label class="block text-sm font-bold text-gray-700 mb-2">صورة المنتج</label>
+                    <div class="relative group cursor-pointer w-full h-48 bg-gray-50 border-2 border-dashed border-gray-300 rounded-2xl hover:border-indigo-500 hover:bg-indigo-50 transition-all overflow-hidden flex flex-col items-center justify-center text-gray-400">
+                        <input type="file" name="imageFile" accept="image/*" class="absolute inset-0 opacity-0 cursor-pointer z-10" onchange="window.handleFileSelect(event)">
+                        
+                        <div id="upload-placeholder" class="text-center">
+                            <i data-lucide="camera" class="w-8 h-8 mx-auto mb-2 text-indigo-400"></i>
+                            <span class="text-sm font-semibold">اضغط للتصوير أو الاختيار</span>
+                        </div>
+                        <img id="preview-image" class="absolute inset-0 w-full h-full object-cover hidden">
+                    </div>
+                </div>
+
+                <!-- البيانات الأساسية -->
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-sm font-bold text-gray-700 mb-1">اسم المنتج</label>
+                        <input type="text" name="name" class="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all" placeholder="قميص / حذاء..." required>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-bold text-gray-700 mb-1">الماركة</label>
+                        <input type="text" name="brand" class="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all" placeholder="أديداس / زارا..." required>
+                    </div>
+                </div>
+
+                <!-- السعر والعمولة -->
+                <div class="bg-indigo-50/50 p-4 rounded-2xl border border-indigo-100">
+                    <label class="block text-sm font-bold text-gray-700 mb-1">السعر الذي تريد استلامه (د.أ)</label>
+                    <input type="number" name="price" step="0.5" min="1" class="w-full bg-white border border-gray-200 rounded-xl px-4 py-3 font-black text-xl text-indigo-900 focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all" placeholder="0.00" oninput="window.updateCommission(this)" required>
+                    
+                    <div class="mt-4 pt-3 border-t border-indigo-100 text-sm space-y-1">
+                        <div class="flex justify-between text-gray-600">
+                            <span>العمولة (5%):</span>
+                            <span class="font-bold text-red-600"><span id="calc-commission">0.00</span> د.أ</span>
+                        </div>
+                        <div class="flex justify-between text-gray-800 font-bold">
+                            <span>السعر الإجمالي للمشتري:</span>
+                            <span class="text-indigo-700 text-lg"><span id="calc-total">0.00</span> د.أ</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- الوصف -->
+                <div>
+                    <label class="block text-sm font-bold text-gray-700 mb-1">التفاصيل</label>
+                    <textarea name="desc" rows="3" class="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all" placeholder="المقاس، اللون، الحالة، ملاحظات..." required></textarea>
+                </div>
+
+                <!-- الأزرار -->
+                <div class="flex flex-col gap-3 pt-2">
+                    <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-4 rounded-xl shadow-lg shadow-indigo-200 transition-transform active:scale-[0.98] flex justify-center items-center gap-2">
+                        <i data-lucide="send" class="w-5 h-5"></i>
+                        نشر الإعلان الآن
+                    </button>
+                    
+                    <button type="button" onclick="window.toggleModal()" class="w-full bg-white border-2 border-gray-100 hover:bg-gray-50 text-gray-700 font-bold py-4 rounded-xl transition-colors">
+                        إلغاء
+                    </button>
+                </div>
+
+            </form>
+        </div>
+    </div>
+
+</body>
+</html>
